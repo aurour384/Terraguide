@@ -1,0 +1,14 @@
+# 首轮采集白名单。右侧的分类名直接作为 MediaWiki API 的 cmtitle 参数。
+# 实测记录见 plan/week01_api_notes.md。
+categories:
+  bosses: "Category:Boss NPCs"
+  weapons: "Category:Weapon items"
+  armor: "Category:Armor sets"
+
+# 原版采集的标题排除词。爬虫接入时忽略大小写，按完整词或短语匹配。
+exclude_title_terms:
+  - "Mods"
+  - "Calamity"
+  - "Thorium"
+  - "tModLoader"
+  - "Modded"
