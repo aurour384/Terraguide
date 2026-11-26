@@ -1,18 +1,20 @@
 """TerraGuide 爬虫 —— 抓取 + 落盘
 
 流程：
-1. request_api()  统一封装 User-Agent / 超时 / 限速 / 重试 / 错误记录
-2. list_category_members()  按分类取页面标题（支持 continue 翻页）
-3. fetch_page_html()        取单页 HTML 正文
-4. 落盘到 crawler/raw/{分类}/{标题}.html，并追加 crawler/raw/_manifest.jsonl 记录
+1. load_config()   读取 crawler/categories.yaml（分类白名单 + 排除词）
+2. request_api()  统一封装 User-Agent / 超时 / 限速 / 重试 / 错误记录
+3. list_category_members()  按分类取页面标题（continue 翻页，每批 CM_BATCH 条）
+4. fetch_page_html()        取单页 HTML 正文
+5. 落盘到 crawler/raw/{分类}/{标题}.html，并追加 crawler/raw/_manifest.jsonl 记录
    已存在的文件直接跳过，支持断点续爬
 
-分类与排除词依据 crawler/categories.yaml，API 参数依据 plan/week01_api_notes.md。
+API 参数依据 plan/week01_api_notes.md。
 """
 
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timezone
@@ -20,6 +22,7 @@ from pathlib import Path
 from urllib.parse import quote
 
 import requests
+import yaml
 
 API_URL = "https://terraria.wiki.gg/api.php"
 WIKI_PAGE_URL = "https://terraria.wiki.gg/wiki/"
@@ -27,14 +30,11 @@ WIKI_PAGE_URL = "https://terraria.wiki.gg/wiki/"
 BASE_DIR = Path(__file__).resolve().parent
 RAW_DIR = BASE_DIR / "raw"
 MANIFEST_PATH = RAW_DIR / "_manifest.jsonl"
+CONFIG_PATH = BASE_DIR / "categories.yaml"
 
-# 来自 crawler/categories.yaml
-CATEGORIES = {
-    "bosses": "Category:Boss NPCs",
-    "weapons": "Category:Weapon items",
-    "armor": "Category:Armor sets",
-}
-EXCLUDE_TERMS = ("Mods", "Calamity", "Thorium", "tModLoader", "Modded")
+# 单次 categorymembers 请求最多返回多少条。故意小于 500：
+# 既能缩小单次响应体积，也能让翻页逻辑（continue）在试跑时真正被执行到。
+CM_BATCH = 20
 
 # 每个分类本次最多抓多少页（试抓用，验证流程后可调大）
 MAX_PAGES_PER_CATEGORY = 40
@@ -142,6 +142,34 @@ def request_api(params: dict, context: str = "") -> dict:
     raise ApiError(f"[{context}] 连续 {MAX_RETRIES} 次请求均失败，最后原因：{last_reason}")
 
 
+def load_config(path: Path = CONFIG_PATH) -> tuple[dict[str, str], tuple[str, ...]]:
+    """读取 categories.yaml，返回 (分类别名→分类名, 排除词)。"""
+    if not path.exists():
+        raise SystemExit(f"找不到分类配置：{path}")
+
+    try:
+        data = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise SystemExit(f"无法读取 {path.name}：{exc}") from exc
+    if not isinstance(data, dict):
+        raise SystemExit(f"{path.name} 顶层必须是映射")
+
+    categories = data.get("categories")
+    if not isinstance(categories, dict) or not categories:
+        raise SystemExit(f"{path.name} 缺少有效的 categories 映射")
+    for slug, category in categories.items():
+        if not isinstance(slug, str) or not re.fullmatch(r"[a-z][a-z0-9_-]*", slug):
+            raise SystemExit(f"{path.name} 的分类别名无效：{slug!r}（小写字母开头，仅限小写字母、数字、下划线和连字符）")
+        if not isinstance(category, str) or not category.startswith("Category:") or not category.removeprefix("Category:").strip():
+            raise SystemExit(f"{path.name} 中 {slug} 必须使用非空的 Category: 分类名")
+
+    excludes = data.get("exclude_title_terms", [])
+    if not isinstance(excludes, list) or any(not isinstance(t, str) or not t.strip() for t in excludes):
+        raise SystemExit(f"{path.name} 的 exclude_title_terms 必须是非空字符串组成的列表")
+
+    return categories, tuple(t.strip() for t in excludes)
+
+
 def list_category_members(category: str, limit: int) -> list[str]:
     """列出分类成员标题，按 continue 翻页，最多取 limit 条。"""
     params = {
@@ -149,21 +177,26 @@ def list_category_members(category: str, limit: int) -> list[str]:
         "list": "categorymembers",
         "cmtitle": category,
         "cmnamespace": 0,       # 只取主命名空间（0）的条目
-        "cmlimit": min(limit, 500),
+        "cmlimit": min(CM_BATCH, limit, 500),
         "format": "json",
         "formatversion": 2,
     }
 
     titles: list[str] = []
+    page_no = 0
     while len(titles) < limit:
+        page_no += 1
         data = request_api(params, context=f"categorymembers:{category}")
-        for item in data.get("query", {}).get("categorymembers", []):
+        batch = data.get("query", {}).get("categorymembers", [])
+        for item in batch:
             titles.append(item["title"])
             if len(titles) >= limit:
                 break
 
+        print(f"  第 {page_no} 次请求返回 {len(batch)} 条，累计 {len(titles)} 条")
+
         cont = data.get("continue")
-        if not cont:
+        if not cont or len(titles) >= limit:
             break
         params.update(cont)     # 带上 continue / cmcontinue 继续翻页
 
@@ -195,10 +228,10 @@ def fetch_page_html(title: str) -> dict:
     }
 
 
-def _is_excluded(title: str) -> bool:
+def _is_excluded(title: str, exclude_terms: tuple[str, ...]) -> bool:
     """标题命中排除词则跳过（对应 categories.yaml 的 exclude_title_terms）。"""
-    lowered = title.lower()
-    return any(term.lower() in lowered for term in EXCLUDE_TERMS)
+    return any(re.search(rf"(?<!\w){re.escape(term)}(?!\w)", title, re.IGNORECASE)
+               for term in exclude_terms)
 
 
 def _safe_filename(title: str) -> str:
@@ -215,12 +248,28 @@ def append_manifest(record: dict) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def main(limit: int) -> int:
+def main(limit: int, only: str = "") -> int:
+    categories_all, exclude_terms = load_config()
+
+    if only:
+        picks = [s.strip() for s in only.split(",") if s.strip()]
+        unknown = [s for s in picks if s not in categories_all]
+        if unknown:
+            raise SystemExit(
+                f"未知分类：{', '.join(unknown)}；可选：{', '.join(categories_all)}"
+            )
+        categories = {s: categories_all[s] for s in picks}
+    else:
+        categories = categories_all
+
     RAW_DIR.mkdir(parents=True, exist_ok=True)
+
+    print(f"已加载 {CONFIG_PATH.name}：{len(categories)} 个分类，{len(exclude_terms)} 个排除词，"
+          f"单次最多取 {CM_BATCH} 条")
 
     stats = {"success": 0, "skip_exists": 0, "skip_excluded": 0, "failed": 0}
 
-    for slug, category in CATEGORIES.items():
+    for slug, category in categories.items():
         print(f"\n=== {category} ===")
         try:
             titles = list_category_members(category, limit)
@@ -229,12 +278,12 @@ def main(limit: int) -> int:
             stats["failed"] += 1
             continue
 
-        print(f"本批 {len(titles)} 个页面")
+        print(f"共 {len(titles)} 个页面")
         out_dir = RAW_DIR / slug
         out_dir.mkdir(parents=True, exist_ok=True)
 
         for title in titles:
-            if _is_excluded(title):
+            if _is_excluded(title, exclude_terms):
                 log.info("跳过（命中排除词）：%s", title)
                 append_manifest({"title": title, "category": category, "status": "skip_excluded"})
                 stats["skip_excluded"] += 1
@@ -303,9 +352,13 @@ if __name__ == "__main__":
         "--limit", type=int, default=MAX_PAGES_PER_CATEGORY,
         help=f"每个分类最多抓取的页面数（默认 {MAX_PAGES_PER_CATEGORY}）",
     )
+    parser.add_argument(
+        "--category", default="",
+        help="只跑指定分类，多个用逗号分隔，如 bosses,armor；默认跑 categories.yaml 全部",
+    )
     args = parser.parse_args()
 
     try:
-        sys.exit(main(args.limit))
+        sys.exit(main(args.limit, args.category))
     finally:
         pause_before_exit()

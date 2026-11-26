@@ -225,13 +225,18 @@ npm install
 npm run dev
 ```
 
-### 构建 Wiki 索引
+### 试抓 Wiki 原始 HTML
+
+在仓库根目录运行：
 
 ```bash
-# 采集原版 Wiki 页面并写入 ChromaDB（首次运行耗时较长）
-python crawler/scrape.py
-python crawler/ingest.py
+python -m pip install -r crawler/requirements.txt
+python -X utf8 crawler/scrape.py --limit 5
+# 单独验证 Boss 分类翻页（每批最多 20 条）
+python -X utf8 crawler/scrape.py --category bosses --limit 21
 ```
+
+爬虫从 [`crawler/categories.yaml`](crawler/categories.yaml) 读取分类和标题排除词。`--limit` 限制每个分类的候选页面数，不是新保存的文件数；已存在或命中排除词的页面会跳过。原始 HTML 和抓取记录保存在 `crawler/raw/`，清洗和索引构建还未实现。
 
 <a id="api"></a>
 
